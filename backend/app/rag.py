@@ -1,10 +1,7 @@
 import hashlib
-import logging
-import random
 import re
-import time
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any
 
 import chromadb
 from google import genai
@@ -14,17 +11,27 @@ from pypdf import PdfReader
 from .config import get_settings
 
 
-logger = logging.getLogger(__name__)
-T = TypeVar("T")
-
 settings = get_settings()
 
 Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
 Path(settings.chroma_dir).mkdir(parents=True, exist_ok=True)
 
+
 gemini_client = genai.Client(
     api_key=settings.gemini_api_key,
+    http_options=types.HttpOptions(
+        timeout=30_000,
+        retry_options=types.HttpRetryOptions(
+            attempts=3,
+            initial_delay=1.0,
+            max_delay=8.0,
+            exp_base=2.0,
+            jitter=1.0,
+            http_status_codes=[500, 502, 503, 504],
+        ),
+    ),
 )
+
 
 chroma_client = chromadb.PersistentClient(
     path=settings.chroma_dir,
@@ -34,53 +41,49 @@ collection = chroma_client.get_or_create_collection(
     name="researchos_documents_gemini",
 )
 
+
 NO_ANSWER_MESSAGE = (
-    "Uploaded documents mein iska reliable answer nahi mila."
+    "No reliable answer was found in the selected document."
 )
 
-MAX_API_ATTEMPTS = 3
 EMBEDDING_BATCH_SIZE = 32
 
 
-def call_with_retry(
-    operation: Callable[[], T],
-    operation_name: str,
-) -> T:
-    for attempt in range(MAX_API_ATTEMPTS):
-        try:
-            return operation()
+def raise_api_error(error: errors.APIError) -> None:
+    """Convert API errors into readable application errors."""
+    code = error.code
 
-        except errors.APIError as error:
-            if error.code != 503:
-                raise
+    if code in {500, 502, 503, 504}:
+        raise RuntimeError(
+            "The AI service is temporarily unavailable. "
+            "Automatic retries were unsuccessful. "
+            "Please try again later."
+        ) from error
 
-            if attempt == MAX_API_ATTEMPTS - 1:
-                logger.warning(
-                    "%s failed after %s application attempts: HTTP 503",
-                    operation_name,
-                    MAX_API_ATTEMPTS,
-                )
+    if code == 429:
+        raise RuntimeError(
+            "The AI service returned a rate-limit or quota error. "
+            "Please check your API quota and billing, "
+            "or wait before trying again."
+        ) from error
 
-                raise RuntimeError(
-                    "Google AI service abhi high demand ki wajah "
-                    "se unavailable hai. Thodi der baad dobara "
-                    "try karein."
-                ) from error
+    if code == 404:
+        raise RuntimeError(
+            "The requested AI model was not found or is not available "
+            "for this project. Check GEMINI_MODEL and "
+            "GEMINI_EMBEDDING_MODEL in the backend environment."
+        ) from error
 
-            delay = (2 ** attempt) + random.uniform(0.0, 1.0)
+    if code in {401, 403}:
+        raise RuntimeError(
+            "The AI request was not authorized. "
+            "Check the backend API key and project permissions."
+        ) from error
 
-            logger.warning(
-                "%s received HTTP 503. Retrying in %.2f seconds "
-                "(application attempt %s/%s).",
-                operation_name,
-                delay,
-                attempt + 2,
-                MAX_API_ATTEMPTS,
-            )
-
-            time.sleep(delay)
-
-    raise RuntimeError("AI request complete nahi ho saka.")
+    raise RuntimeError(
+        f"The AI service rejected the request "
+        f"(HTTP {code}). Check the backend logs."
+    ) from error
 
 
 def calculate_sha256(file_path: str) -> str:
@@ -103,7 +106,9 @@ def split_text(
     overlap: int = 200,
 ) -> list[str]:
     if chunk_size <= 0:
-        raise ValueError("chunk_size must be greater than zero.")
+        raise ValueError(
+            "chunk_size must be greater than zero."
+        )
 
     if not 0 <= overlap < chunk_size:
         raise ValueError(
@@ -141,7 +146,10 @@ def extract_pdf_chunks(
     reader = PdfReader(file_path)
     all_chunks: list[dict[str, Any]] = []
 
-    for page_number, page in enumerate(reader.pages, start=1):
+    for page_number, page in enumerate(
+        reader.pages,
+        start=1,
+    ):
         page_text = page.extract_text() or ""
         page_chunks = split_text(page_text)
 
@@ -168,43 +176,48 @@ def extract_pdf_chunks(
     return all_chunks
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
+def embed_texts(
+    texts: list[str],
+) -> list[list[float]]:
     if not texts:
         return []
 
     all_embeddings: list[list[float]] = []
 
-    for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+    for start in range(
+        0,
+        len(texts),
+        EMBEDDING_BATCH_SIZE,
+    ):
         batch = texts[start:start + EMBEDDING_BATCH_SIZE]
 
-        response = call_with_retry(
-            operation=lambda: gemini_client.models.embed_content(
+        try:
+            response = gemini_client.models.embed_content(
                 model=settings.gemini_embedding_model,
                 contents=batch,
-            ),
-            operation_name="Gemini embeddings",
-        )
+            )
+        except errors.APIError as error:
+            raise_api_error(error)
 
-        response_embeddings = response.embeddings
+        returned_embeddings = response.embeddings or []
 
-        if (
-            not response_embeddings
-            or len(response_embeddings) != len(batch)
-        ):
+        if len(returned_embeddings) != len(batch):
             raise RuntimeError(
-                "Embedding service ne expected number of "
-                "vectors return nahi kiye."
+                "The AI service returned an unexpected number "
+                "of embeddings. Please try again."
             )
 
-        for embedding in response_embeddings:
+        for embedding in returned_embeddings:
             values = embedding.values
 
             if not values:
                 raise RuntimeError(
-                    "Embedding service se empty vector mila."
+                    "The AI service returned an empty embedding."
                 )
 
-            all_embeddings.append(list(values))
+            all_embeddings.append(
+                [float(value) for value in values]
+            )
 
     return all_embeddings
 
@@ -236,15 +249,14 @@ def index_document(
 
     if not chunks:
         raise ValueError(
-            "PDF se readable text nahi mila. "
-            "Scanned PDF ke liye OCR add karna hoga."
+            "No readable text was found in the PDF. "
+            "Scanned PDFs require OCR support."
         )
 
     ids = [item["id"] for item in chunks]
     documents = [item["text"] for item in chunks]
     metadatas = [item["metadata"] for item in chunks]
 
-    # Complete API embedding work before writing to Chroma.
     embeddings = embed_texts(documents)
 
     collection.add(
@@ -277,15 +289,22 @@ def search_documents(
     document_hash = document_hash.strip().lower()
 
     if not question:
-        raise ValueError("Question empty nahi ho sakta.")
+        raise ValueError(
+            "The question must not be empty."
+        )
 
-    if not re.fullmatch(r"[a-f0-9]{64}", document_hash):
+    if not re.fullmatch(
+        r"[a-f0-9]{64}",
+        document_hash,
+    ):
         raise ValueError(
             "A valid selected PDF document_hash is required."
         )
 
     if top_k < 1:
-        raise ValueError("top_k must be greater than zero.")
+        raise ValueError(
+            "top_k must be greater than zero."
+        )
 
     selected_chunks = collection.get(
         where={"document_hash": document_hash},
@@ -303,7 +322,11 @@ def search_documents(
         query_embeddings=[query_embedding],
         where={"document_hash": document_hash},
         n_results=min(top_k, chunk_count),
-        include=["documents", "metadatas", "distances"],
+        include=[
+            "documents",
+            "metadatas",
+            "distances",
+        ],
     )
 
     documents = (results.get("documents") or [[]])[0]
@@ -317,7 +340,11 @@ def search_documents(
         metadatas,
         distances,
     ):
-        if text is None or metadata is None or distance is None:
+        if (
+            text is None
+            or metadata is None
+            or distance is None
+        ):
             continue
 
         matches.append(
@@ -336,7 +363,10 @@ def build_context(
 ) -> str:
     context_parts: list[str] = []
 
-    for source_number, match in enumerate(matches, start=1):
+    for source_number, match in enumerate(
+        matches,
+        start=1,
+    ):
         metadata = match["metadata"]
 
         source_block = (
@@ -360,16 +390,24 @@ def normalize_citation_labels(
     matches: list[dict[str, Any]],
 ) -> str:
     page_by_source = {
-        source_number: int(match["metadata"]["page_number"])
-        for source_number, match in enumerate(matches, start=1)
+        source_number: int(
+            match["metadata"]["page_number"]
+        )
+        for source_number, match in enumerate(
+            matches,
+            start=1,
+        )
     }
 
     citation_pattern = (
         r"\[\s*Source\s+\d+(?:\s*,\s*Page\s+\d+)?"
-        r"(?:\s*,\s*Source\s+\d+(?:\s*,\s*Page\s+\d+)?)*\s*\]"
+        r"(?:\s*,\s*Source\s+\d+"
+        r"(?:\s*,\s*Page\s+\d+)?)*\s*\]"
     )
 
-    def replace_label(match: re.Match[str]) -> str:
+    def replace_label(
+        match: re.Match[str],
+    ) -> str:
         source_numbers = [
             int(number)
             for number in re.findall(
@@ -404,13 +442,10 @@ def generate_answer(
 ) -> str:
     context = build_context(matches)
 
-    prompt = f"""
+    system_instruction = f"""
 You are ResearchOS, an evidence-based document research assistant.
 
-The user's question is:
-{question}
-
-Answer using only the source context below.
+Answer using only the source context supplied with the question.
 The context contains retrieved excerpts from the selected PDF.
 Do not use knowledge from other documents or previous answers.
 
@@ -425,34 +460,40 @@ Security and answer rules:
    page_number from the context, in this format: [Source 1, Page 2].
 7. Never cite a source number that is absent from the context.
 8. Clearly mention if the provided sources contradict each other.
-9. Answer in English, except for the exact refusal message above.
+9. Answer in English.
 10. Keep the answer clear, helpful, and concise.
 11. A footer or document title alone is not sufficient evidence
     for substantive claims.
 12. For summaries, summarize only what the provided excerpts support.
     Do not imply that omitted parts of the PDF were reviewed.
+"""
+
+    prompt = f"""
+USER QUESTION:
+{question}
 
 SOURCE CONTEXT:
 {context}
 """
 
-    response = call_with_retry(
-        operation=lambda: gemini_client.models.generate_content(
+    try:
+        response = gemini_client.models.generate_content(
             model=settings.gemini_model,
             contents=prompt,
             config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
                 temperature=0.1,
             ),
-        ),
-        operation_name="Gemini answer generation",
-    )
+        )
+    except errors.APIError as error:
+        raise_api_error(error)
 
     answer = (response.text or "").strip()
 
     if not answer:
         raise RuntimeError(
-            "AI service ne empty answer return kiya. "
-            "Dobara try karein."
+            "The AI service returned no answer. "
+            "Please try again."
         )
 
     return normalize_citation_labels(
@@ -466,14 +507,19 @@ def build_citations(
 ) -> list[dict[str, Any]]:
     citations: list[dict[str, Any]] = []
 
-    for source_number, match in enumerate(matches, start=1):
+    for source_number, match in enumerate(
+        matches,
+        start=1,
+    ):
         metadata = match["metadata"]
 
         citations.append(
             {
                 "citation_id": f"source_{source_number}",
                 "document_name": metadata["document_name"],
-                "page_number": int(metadata["page_number"]),
+                "page_number": int(
+                    metadata["page_number"]
+                ),
                 "chunk_id": (
                     f"{metadata['document_hash'][:12]}_"
                     f"p{metadata['page_number']}_"
@@ -503,7 +549,8 @@ def answer_question(
             "citations": [],
             "confidence": "low",
             "limitations": [
-                "Selected PDF ke indexed chunks nahi mile."
+                "No indexed chunks were found "
+                "for the selected PDF."
             ],
         }
 
@@ -518,8 +565,8 @@ def answer_question(
             "citations": [],
             "confidence": "low",
             "limitations": [
-                "Selected PDF ke retrieved chunks mein question ka "
-                "supporting evidence nahi mila."
+                "The retrieved excerpts did not provide "
+                "sufficient evidence to answer the question."
             ],
         }
 
@@ -541,12 +588,16 @@ def answer_question(
         "citations": build_citations(matches),
         "confidence": confidence,
         "limitations": [
-            "Answer selected PDF ke retrieved excerpts par based hai, "
-            "poori PDF ki exhaustive review par nahi.",
-            "Confidence retrieval-distance heuristic hai; "
-            "factual correctness ka verified score nahi.",
-            "Citation labels metadata se formatted hain; "
-            "claim-level verification pending hai.",
-            "Important answers ko original PDF page se verify karo.",
+            "The answer is based on retrieved excerpts "
+            "from the selected PDF, not an exhaustive "
+            "review of the entire document.",
+            "Confidence is an uncalibrated retrieval-distance "
+            "heuristic, not a verified measure of "
+            "factual correctness.",
+            "Citation labels are formatted using metadata; "
+            "individual claims have not been independently "
+            "verified against the sources.",
+            "Verify important answers against "
+            "the original PDF pages.",
         ],
     }
